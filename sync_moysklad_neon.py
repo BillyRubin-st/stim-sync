@@ -21,7 +21,7 @@ from psycopg2 import OperationalError
 # ================== КОНСТАНТЫ ==================
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 MS_LIMIT = 1000
-FIRST_LOAD_DAYS = 7
+FIRST_LOAD_DAYS = 9999
 ATTR_NAMES = ["Проект", "Таргетолог", "Аккаунт", "Контент", "Сектор"]
 
 # сколько заказов обрабатывать в одной транзакции
