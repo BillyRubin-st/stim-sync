@@ -91,14 +91,16 @@ def fetch_json(url: str, headers: Dict[str, str], max_attempts=6) -> Dict[str, A
         resp.raise_for_status()
 
 # ---------- Вытаскиваем id из meta.href ----------
-def path_id(obj: Any) -> str:
+def path_id_(obj):
+    """Вернуть UUID из obj.meta.href или None, если его нет."""
     try:
-        href = obj.get("meta", {}).get("href", "")
+        href = (obj or {}).get('meta', {}).get('href', '')
         if not href:
-            return ""
-        return href.rstrip("/").split("/")[-1]
+            return None
+        # берём всё после последнего слэша; если пусто — вернём None
+        return href.rsplit('/', 1)[-1] or None
     except Exception:
-        return ""
+        return None
 
 # ---------- Разворачивание имен по meta.href с кэшем ----------
 _name_cache: Dict[str, str] = {}
