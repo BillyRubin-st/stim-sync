@@ -1,0 +1,31 @@
+name: Sync MoySklad → Neon
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/30 * * * *"  # каждые 30 минут (UTC)
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          MS_TOKEN: ${{ secrets.MS_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python sync_moysklad_neon.py
