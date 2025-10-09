@@ -24,6 +24,11 @@ MS_LIMIT = 1000
 FIRST_LOAD_DAYS = 9999
 ATTR_NAMES = ["Проект", "Таргетолог", "Аккаунт", "Контент", "Сектор"]
 
+# Сдвиг локального времени (в часах)
+# МойСклад возвращает время по Москве (UTC+3)
+# Бишкек = UTC+6, значит нужно +3 часа
+LOCAL_TIME_SHIFT_HOURS = int(os.getenv("LOCAL_TIME_SHIFT_HOURS", "3"))
+
 # сколько заказов обрабатывать в одной транзакции
 BATCH_SIZE = 500
 
@@ -174,7 +179,20 @@ CREATE INDEX IF NOT EXISTS idx_orders_project   ON orders(project);
 CREATE INDEX IF NOT EXISTS idx_orders_state     ON orders(state);
 CREATE INDEX IF NOT EXISTS idx_pos_order_id     ON order_positions(order_id);
 """
+# ---------- Вьюха для DataLens ----------
+VIEW_ORDERS_DATALENS = f"""
+CREATE OR REPLACE VIEW orders_datalens AS
+SELECT
+  o.*,
+  (o.moment  + INTERVAL '{LOCAL_TIME_SHIFT_HOURS} hour') AS moment_local,
+  (o.updated + INTERVAL '{LOCAL_TIME_SHIFT_HOURS} hour') AS updated_local
+FROM orders o;
+"""
 
+def ensure_view(cur):
+    """Создаёт или обновляет представление orders_datalens"""
+    cur.execute(VIEW_ORDERS_DATALENS)
+    
 UPSERT_ORDER = """
 INSERT INTO orders(id, name, moment, updated, sum_rub, state, agent_id, store_id,
                    project, targetolog, account, content, sector)
@@ -352,6 +370,7 @@ def sync():
                 conn.autocommit = False
                 with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                     ensure_schema(cur)
+                    ensure_view(cur) # создаём/обновляем view orders_datalens
 
                     wm_key = "customerorder"
                     wm = get_watermark(cur, wm_key)
