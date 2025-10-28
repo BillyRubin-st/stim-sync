@@ -3,7 +3,7 @@ name: FB ETL → Neon
 on:
   schedule:
     - cron: "10 9 * * *"   # 09:10 UTC = 15:10 Asia/Bishkek
-  workflow_dispatch: {}     # ручной запуск
+  workflow_dispatch: {}
 
 jobs:
   etl:
@@ -28,8 +28,10 @@ jobs:
           FB_ACCESS_TOKENS: ${{ secrets.FB_ACCESS_TOKENS }}
           FB_ACCOUNTS: ${{ secrets.FB_ACCOUNTS }}
           DAYS_BACK: ${{ secrets.DAYS_BACK || '180' }}
+          REFRESH_TAIL_DAYS: ${{ secrets.REFRESH_TAIL_DAYS || '2' }}
           FB_LEVEL: ad
           REPORT_LOCALE: ru_RU
-          FB_DEBUG: "1"
+          # Включи 1 для детальных логов при отладке
+          FB_DEBUG: "0"
         run: |
           python fb_etl.py
