@@ -27,7 +27,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FB_ACCESS_TOKENS: ${{ secrets.FB_ACCESS_TOKENS }}
           FB_ACCOUNTS: ${{ secrets.FB_ACCOUNTS }}
-          DAYS_BACK: ${{ secrets.DAYS_BACK }}
+          DAYS_BACK: ${{ secrets.DAYS_BACK || '180' }}
           FB_LEVEL: ad
           REPORT_LOCALE: ru_RU
         run: |
