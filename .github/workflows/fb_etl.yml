@@ -31,7 +31,6 @@ jobs:
           REFRESH_TAIL_DAYS: ${{ secrets.REFRESH_TAIL_DAYS || '2' }}
           FB_LEVEL: ad
           REPORT_LOCALE: ru_RU
-          # Включи 1 для детальных логов при отладке
           FB_DEBUG: "0"
         run: |
           python fb_etl.py
