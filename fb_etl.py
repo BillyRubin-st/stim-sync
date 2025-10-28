@@ -1,3 +1,4 @@
+# fb_etl.py
 import os
 import sys
 import json
@@ -8,11 +9,11 @@ import psycopg2
 from psycopg2.extras import execute_values
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-# ---------- ЛОГИ ----------
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 FB_DEBUG = (os.getenv("FB_DEBUG", "0").strip() == "1")
 
-# ---------- ENV ----------
+# -------------------- ENV ---------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 FB_ACCESS_TOKENS = [t.strip() for t in os.getenv("FB_ACCESS_TOKENS", "").split(",") if t.strip()]
 FB_ACCOUNTS = [a.strip().replace("act_", "") for a in os.getenv("FB_ACCOUNTS", "").split(",") if a.strip()]
@@ -23,10 +24,9 @@ try:
 except Exception:
     DAYS_BACK = 180
 
-# сколько последних дней всегда переобновляем (догон конверсий)
 raw_tail = (os.getenv("REFRESH_TAIL_DAYS") or "2").strip()
 try:
-    REFRESH_TAIL_DAYS = max(0, int(raw_tail))
+    REFRESH_TAIL_DAYS = max(0, int(raw_tail))  # сколько последних дней всегда переобновляем
 except Exception:
     REFRESH_TAIL_DAYS = 2
 
@@ -56,7 +56,14 @@ BASE_PARAMS = {
     "locale": REPORT_LOCALE
 }
 
-# ---------- Вспомогательные ----------
+# ----------------- ВСПОМОГАТЕЛЬНЫЕ -----------------
+def mask_token(tok: str) -> str:
+    if not tok:
+        return ""
+    if len(tok) <= 10:
+        return "***"
+    return tok[:6] + "..." + tok[-4:]
+
 def parse_actions(actions, action_type):
     if not actions:
         return 0
@@ -81,17 +88,12 @@ def parse_roas(purchase_roas):
     except Exception:
         return None
 
-def mask_token(tok: str) -> str:
-    if not tok:
-        return ""
-    if len(tok) <= 10:
-        return "***"
-    return tok[:6] + "..." + tok[-4:]
-
 @retry(wait=wait_exponential(multiplier=1, min=1, max=60), stop=stop_after_attempt(5))
 def fb_get(url, params):
+    """Запрос к FB с ретраями на троттлинг/5xx и подробными ошибками."""
     resp = requests.get(url, params=params, timeout=60)
-    # бывают не-JSON ответы при ошибках
+
+    # иногда приходит не-JSON
     try:
         data = resp.json()
     except Exception:
@@ -109,15 +111,76 @@ def fb_get(url, params):
         msg  = err.get("message")
         sub  = err.get("error_subcode")
         typ  = err.get("type")
-        if code in (1,2,4,17,32,613):  # троттлинг/лимит
+        # троттлинг/лимиты — ретраим
+        if code in (1,2,4,17,32,613):
             if FB_DEBUG:
                 logging.error("FB throttled | code=%s sub=%s type=%s msg=%s", code, sub, typ, msg)
             raise RuntimeError(f"FB throttled code={code} sub={sub} type={typ} msg={msg}")
+        # неверный токен/нет доступа — не ретраим, пробрасываем
         raise RuntimeError(f"FB error code={code} sub={sub} type={typ} msg={msg}")
+
     return data
 
+# --------------------- БД ----------------------
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
+
+def ensure_fb_tables(conn):
+    """Создаёт схему/таблицу для инсайтов, если их нет."""
+    sql = """
+    CREATE SCHEMA IF NOT EXISTS fb;
+
+    CREATE TABLE IF NOT EXISTS fb.insights_daily (
+        date               date        NOT NULL,
+        account_id         text        NOT NULL,
+        campaign_id        text,
+        adset_id           text,
+        ad_id              text,
+        campaign_name      text,
+        adset_name         text,
+        ad_name            text,
+        currency           text,
+        impressions        bigint,
+        clicks             bigint,
+        reach              bigint,
+        spend              numeric(18,6),
+        purchases          bigint,
+        leads              bigint,
+        inline_link_clicks bigint,
+        cpc                numeric(18,6),
+        cpm                numeric(18,6),
+        cpp                numeric(18,6),
+        ctr                numeric(18,6),
+        roas               numeric(18,6),
+        pulled_at          timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT insights_daily_pk PRIMARY KEY (date, account_id, campaign_id, adset_id, ad_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fb_date     ON fb.insights_daily(date);
+    CREATE INDEX IF NOT EXISTS idx_fb_campaign ON fb.insights_daily(campaign_id);
+    CREATE INDEX IF NOT EXISTS idx_fb_ad       ON fb.insights_daily(ad_id);
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+def ensure_watermarks(conn):
+    """Создаёт/чинит таблицу водяных знаков."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public.sync_watermarks (
+              source    TEXT PRIMARY KEY,
+              last_date DATE
+            );
+        """)
+        cur.execute("ALTER TABLE public.sync_watermarks ADD COLUMN IF NOT EXISTS last_date DATE;")
+        # если есть строки без даты — поставим позавчера (чтобы подхватить хвост)
+        cur.execute("""
+            UPDATE public.sync_watermarks
+            SET last_date = COALESCE(last_date, CURRENT_DATE - INTERVAL '2 days');
+        """)
+        cur.execute("ALTER TABLE public.sync_watermarks ALTER COLUMN last_date SET NOT NULL;")
+    conn.commit()
 
 def upsert_rows(conn, rows):
     if not rows:
@@ -155,7 +218,6 @@ def upsert_rows(conn, rows):
     conn.commit()
     return len(rows)
 
-# ---------- Watermark ----------
 def get_last_synced_date(conn, source):
     with conn.cursor() as cur:
         cur.execute("SELECT last_date FROM public.sync_watermarks WHERE source = %s", (source,))
@@ -171,7 +233,7 @@ def update_last_synced_date(conn, source, date_):
         """, (source, date_))
     conn.commit()
 
-# ---------- FB fetch ----------
+# --------------------- FB ----------------------
 def fetch_account_day(token, account_id, day):
     url = f"{GRAPH}/act_{account_id}/insights"
     params = BASE_PARAMS.copy()
@@ -229,7 +291,7 @@ def daterange(start, end):
         yield cur
         cur += dt.timedelta(days=1)
 
-# ---------- MAIN ----------
+# --------------------- MAIN --------------------
 def main():
     if not DATABASE_URL or not FB_ACCOUNTS or not FB_ACCESS_TOKENS:
         logging.error("ENV DATABASE_URL, FB_ACCOUNTS, FB_ACCESS_TOKENS must be set")
@@ -240,14 +302,17 @@ def main():
 
     conn = get_conn()
     try:
+        # гарантируем наличие таблиц
+        ensure_fb_tables(conn)
+        ensure_watermarks(conn)
+
         source_name = "facebook_insights"
         last_synced = get_last_synced_date(conn, source_name)
 
-        # старт при первом запуске = последние DAYS_BACK дней
         default_start = end - dt.timedelta(days=DAYS_BACK)
 
         if last_synced:
-            # инкремент + «хвост» REFRESH_TAIL_DAYS
+            # инкремент + «хвост» переобновления
             start = max(default_start, last_synced - dt.timedelta(days=max(0, REFRESH_TAIL_DAYS - 1)))
             logging.info(f"Incremental: last_synced={last_synced}, start={start}, end={end}, tail={REFRESH_TAIL_DAYS}")
         else:
