@@ -1,2 +1,6 @@
 requests==2.32.3
 psycopg2-binary==2.9.9
+requests
+psycopg2-binary
+tenacity
+python-dotenv
