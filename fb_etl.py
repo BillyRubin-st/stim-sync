@@ -8,13 +8,20 @@ import psycopg2
 from psycopg2.extras import execute_values
 from tenacity import retry, wait_exponential, stop_after_attempt
 
+# --------- ЛОГИ ---------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+FB_DEBUG = (os.getenv("FB_DEBUG", "0").strip() == "1")
 
+# --------- ENV ---------
 DATABASE_URL = os.getenv("DATABASE_URL")
 FB_ACCESS_TOKENS = [t.strip() for t in os.getenv("FB_ACCESS_TOKENS", "").split(",") if t.strip()]
-FB_ACCOUNTS = [a.strip() for a in os.getenv("FB_ACCOUNTS", "").split(",") if a.strip()]
+FB_ACCOUNTS = [a.strip().replace("act_", "") for a in os.getenv("FB_ACCOUNTS", "").split(",") if a.strip()]
 raw_days = (os.getenv("DAYS_BACK") or "180").strip()
-DAYS_BACK = int(raw_days)
+try:
+    DAYS_BACK = int(raw_days)
+except Exception:
+    DAYS_BACK = 180
+
 GRAPH = os.getenv("FB_GRAPH_BASE", "https://graph.facebook.com/v21.0")
 LEVEL = os.getenv("FB_LEVEL", "ad")
 REPORT_LOCALE = os.getenv("REPORT_LOCALE", "ru_RU")
@@ -65,17 +72,43 @@ def parse_roas(purchase_roas):
     except Exception:
         return None
 
-@retry(wait=wait_exponential(multiplier=1, min=1, max=60), stop=stop_after_attempt(7))
+def mask_token(tok: str) -> str:
+    if not tok:
+        return ""
+    if len(tok) <= 10:
+        return "***"
+    return tok[:6] + "..." + tok[-4:]
+
+@retry(wait=wait_exponential(multiplier=1, min=1, max=60), stop=stop_after_attempt(5))
 def fb_get(url, params):
-    r = requests.get(url, params=params, timeout=60)
-    data = r.json()
-    if r.status_code >= 500:
-        raise RuntimeError(f"FB 5xx {r.status_code} {data}")
+    resp = requests.get(url, params=params, timeout=60)
+    # Иногда API отвечает текстом об ошибке без json
+    try:
+        data = resp.json()
+    except Exception:
+        txt = resp.text[:500]
+        raise RuntimeError(f"FB non-JSON response [{resp.status_code}]: {txt}")
+
+    if resp.status_code >= 500:
+        # ретраи по 5xx
+        if FB_DEBUG:
+            logging.error("FB 5xx: %s | url=%s | params=%s", resp.status_code, url, params)
+        raise RuntimeError(f"FB 5xx: {resp.status_code}")
+
     if "error" in data:
         err = data["error"]
-        if err.get("code") in (1,2,4,17,32,613):
-            raise RuntimeError(f"FB throttled {err}")
-        raise RuntimeError(f"FB error {err}")
+        code = err.get("code")
+        msg = err.get("message")
+        sub = err.get("error_subcode")
+        typ = err.get("type")
+        # На ограничениях — ретраим; на прочих — поднимем исключение
+        if code in (1,2,4,17,32,613):
+            if FB_DEBUG:
+                logging.error("FB throttled | code=%s sub=%s type=%s msg=%s", code, sub, typ, msg)
+            raise RuntimeError(f"FB throttled code={code} sub={sub} type={typ} msg={msg}")
+        # Неретраиваемые ошибки (невалидный токен, доступ к аккаунту и т.п.)
+        raise RuntimeError(f"FB error code={code} sub={sub} type={typ} msg={msg}")
+
     return data
 
 def get_conn():
@@ -184,21 +217,25 @@ def main():
     end   = today
 
     logging.info(f"Range: {start}..{end}")
-    inserted = 0
+    inserted_total = 0
     conn = get_conn()
     try:
         for i, acc in enumerate(FB_ACCOUNTS):
             token = FB_ACCESS_TOKENS[i % len(FB_ACCESS_TOKENS)]
-            logging.info(f"Account {acc} with token #{(i % len(FB_ACCESS_TOKENS))+1}")
+            logging.info(f"[ACC] {acc} | token={mask_token(token)}")
             for day in daterange(start, end):
-                rows = fetch_account_day(token, acc, day)
-                if rows:
+                try:
+                    rows = fetch_account_day(token, acc, day)
                     cnt = upsert_rows(conn, rows)
-                    inserted += cnt
-                    logging.info(f"{acc} {day}: upsert {cnt}")
+                    inserted_total += cnt
+                    logging.info(f"[OK] {acc} {day}: upsert {cnt}")
+                except Exception as e:
+                    logging.error(f"[SKIP] Account {acc} day {day} failed: {e}")
+                    # идём дальше к следующему дню/аккаунту
+                    continue
     finally:
         conn.close()
-    logging.info(f"Done. total upserted: {inserted}")
+    logging.info(f"Done. total upserted: {inserted_total}")
 
 if __name__ == "__main__":
     main()
