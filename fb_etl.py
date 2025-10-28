@@ -6,15 +6,17 @@ import logging
 import datetime as dt
 import requests
 import psycopg2
+from psycopg2 import OperationalError
 from psycopg2.extras import execute_values
-from tenacity import retry, wait_exponential, stop_after_attempt
+from tenacity import retry, wait_exponential, stop_after_attempt, RetryError
 
-# -------------------- ЛОГИ --------------------
+# ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 FB_DEBUG = (os.getenv("FB_DEBUG", "0").strip() == "1")
 
-# -------------------- ENV ---------------------
+# ---------- ENV ----------
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 FB_ACCESS_TOKENS = [t.strip() for t in os.getenv("FB_ACCESS_TOKENS", "").split(",") if t.strip()]
 FB_ACCOUNTS = [a.strip().replace("act_", "") for a in os.getenv("FB_ACCOUNTS", "").split(",") if a.strip()]
 
@@ -56,7 +58,7 @@ BASE_PARAMS = {
     "locale": REPORT_LOCALE
 }
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ -----------------
+# ---------- HELPERS ----------
 def mask_token(tok: str) -> str:
     if not tok:
         return ""
@@ -121,9 +123,17 @@ def fb_get(url, params):
 
     return data
 
-# --------------------- БД ----------------------
+# ---------- DB ----------
 def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+    # keepalive, чтобы соединение не отваливалось на долгих запросах
+    return psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=20,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
 
 def ensure_fb_tables(conn):
     """Создаёт схему/таблицу для инсайтов, если их нет."""
@@ -165,21 +175,55 @@ def ensure_fb_tables(conn):
     conn.commit()
 
 def ensure_watermarks(conn):
-    """Создаёт/чинит таблицу водяных знаков."""
+    """Создаёт/чинит таблицу водяных знаков. Поддерживает твою старую структуру (key/value_utc/last_date/source)."""
     with conn.cursor() as cur:
+        # базовая таблица (если когда-то создавалась иначе — просто добавим недостающее)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS public.sync_watermarks (
-              source    TEXT PRIMARY KEY,
-              last_date DATE
+              key        TEXT,
+              value_utc  timestamptz,
+              last_date  DATE,
+              source     TEXT
             );
         """)
-        cur.execute("ALTER TABLE public.sync_watermarks ADD COLUMN IF NOT EXISTS last_date DATE;")
-        # если есть строки без даты — поставим позавчера (чтобы подхватить хвост)
+        # заполняем source, если пусто
+        cur.execute("UPDATE public.sync_watermarks SET source = COALESCE(source, key);")
+        # удаляем дубликаты по source
         cur.execute("""
-            UPDATE public.sync_watermarks
-            SET last_date = COALESCE(last_date, CURRENT_DATE - INTERVAL '2 days');
+            WITH ranked AS (
+               SELECT ctid,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY source
+                        ORDER BY COALESCE(value_utc, 'epoch'::timestamptz) DESC,
+                                 COALESCE(last_date, DATE '1900-01-01') DESC
+                      ) AS rn
+               FROM public.sync_watermarks
+               WHERE source IS NOT NULL
+            )
+            DELETE FROM public.sync_watermarks sw
+            USING ranked r
+            WHERE sw.ctid = r.ctid AND r.rn > 1;
         """)
-        cur.execute("ALTER TABLE public.sync_watermarks ALTER COLUMN last_date SET NOT NULL;")
+        # уникальность по source
+        cur.execute("""
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE schemaname='public'
+                  AND indexname='uq_sync_watermarks_source'
+              ) THEN
+                CREATE UNIQUE INDEX uq_sync_watermarks_source
+                  ON public.sync_watermarks (source);
+              END IF;
+            END $$;
+        """)
+        # стартовая запись для FB (если нет)
+        cur.execute("""
+          INSERT INTO public.sync_watermarks (source, last_date)
+          VALUES ('facebook_insights', CURRENT_DATE - INTERVAL '3 days')
+          ON CONFLICT (source) DO NOTHING;
+        """)
     conn.commit()
 
 def upsert_rows(conn, rows):
@@ -229,11 +273,23 @@ def update_last_synced_date(conn, source, date_):
         cur.execute("""
             INSERT INTO public.sync_watermarks (source, last_date)
             VALUES (%s, %s)
-            ON CONFLICT (source) DO UPDATE SET last_date = EXCLUDED.last_date;
+            ON CONFLICT (source) DO UPDATE SET last_date = EXCLUDED.last_date,
+                                               value_utc = now();
         """, (source, date_))
     conn.commit()
 
-# --------------------- FB ----------------------
+def safe_update_last_synced_date(conn, source, date_):
+    """Обновляет watermark; если коннект умер — переподключаемся и повторяем один раз."""
+    try:
+        if conn.closed:
+            conn = get_conn()
+        update_last_synced_date(conn, source, date_)
+    except OperationalError:
+        conn = get_conn()
+        update_last_synced_date(conn, source, date_)
+    return conn
+
+# ---------- FB ----------
 def fetch_account_day(token, account_id, day):
     url = f"{GRAPH}/act_{account_id}/insights"
     params = BASE_PARAMS.copy()
@@ -291,7 +347,7 @@ def daterange(start, end):
         yield cur
         cur += dt.timedelta(days=1)
 
-# --------------------- MAIN --------------------
+# ---------- MAIN ----------
 def main():
     if not DATABASE_URL or not FB_ACCOUNTS or not FB_ACCESS_TOKENS:
         logging.error("ENV DATABASE_URL, FB_ACCOUNTS, FB_ACCESS_TOKENS must be set")
@@ -302,7 +358,7 @@ def main():
 
     conn = get_conn()
     try:
-        # гарантируем наличие таблиц
+        # ensure tables
         ensure_fb_tables(conn)
         ensure_watermarks(conn)
 
@@ -329,16 +385,23 @@ def main():
                     cnt = upsert_rows(conn, rows)
                     inserted_total += cnt
                     logging.info(f"[OK] {acc} {day}: upsert {cnt}")
+                except RetryError as e:
+                    cause = e.last_attempt.exception() if hasattr(e, "last_attempt") else e
+                    logging.error(f"[SKIP] Account {acc} day {day} failed: {cause}")
+                    continue
                 except Exception as e:
                     logging.error(f"[SKIP] Account {acc} day {day} failed: {e}")
                     continue
 
-        # обновляем watermark на сегодняшнюю дату
-        update_last_synced_date(conn, source_name, end)
+        # обновляем watermark на сегодняшнюю дату (с защитой от упавшего коннекта)
+        conn = safe_update_last_synced_date(conn, source_name, end)
         logging.info(f"Done. total upserted: {inserted_total}")
 
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
