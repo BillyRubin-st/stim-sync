@@ -30,5 +30,6 @@ jobs:
           DAYS_BACK: ${{ secrets.DAYS_BACK || '180' }}
           FB_LEVEL: ad
           REPORT_LOCALE: ru_RU
+          FB_DEBUG: "1"
         run: |
           python fb_etl.py
