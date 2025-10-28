@@ -13,7 +13,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 DATABASE_URL = os.getenv("DATABASE_URL")
 FB_ACCESS_TOKENS = [t.strip() for t in os.getenv("FB_ACCESS_TOKENS", "").split(",") if t.strip()]
 FB_ACCOUNTS = [a.strip() for a in os.getenv("FB_ACCOUNTS", "").split(",") if a.strip()]
-DAYS_BACK = int(os.getenv("DAYS_BACK", "180"))
+raw_days = (os.getenv("DAYS_BACK") or "180").strip()
+DAYS_BACK = int(raw_days)
 GRAPH = os.getenv("FB_GRAPH_BASE", "https://graph.facebook.com/v21.0")
 LEVEL = os.getenv("FB_LEVEL", "ad")
 REPORT_LOCALE = os.getenv("REPORT_LOCALE", "ru_RU")
