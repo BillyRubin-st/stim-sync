@@ -25,7 +25,7 @@ jobs:
       - name: Run FB incremental ETL to Neon
         env:
           FB_CONFIG: ${{ secrets.FB_CONFIG }}
-          PG_DSN: ${{ secrets.NEON_PG_DSN }}
+          PG_DSN: ${{ secrets.DATABASE_URL }}
           FB_DEFAULT_DAYS_BACK: "60"
           FB_RELOAD_LAST_DAYS: "3"
         run: |
