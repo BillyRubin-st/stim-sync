@@ -12,21 +12,10 @@ from dateutil import parser
 
 FB_API_VERSION = "v17.0"
 
-# JSON-массив, который ты положишь в секрет FB_CONFIG
-# [
-#   { "token": "...", "targetologist": "aijamal", "ids": ["act_123", ...] },
-#   ...
-# ]
 FB_CONFIG_RAW = os.getenv("FB_CONFIG")
-
-# DSN для Neon (Postgres)
-# Пример: PG_DSN="host=... port=5432 dbname=... user=... password=..."
 PG_DSN = os.getenv("PG_DSN")
 
-# Сколько дней назад тянем историю при ПЕРВОМ запуске (если watermark нет)
 DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "60"))
-
-# Сколько последних дней пересчитываем каждый запуск (для корректировок FB)
 RELOAD_LAST_DAYS = int(os.getenv("FB_RELOAD_LAST_DAYS", "3"))
 
 FIELDS = [
@@ -116,11 +105,10 @@ def set_watermark(conn, account_id, last_date):
 
 def fetch_insights_for_account(token, account_id, date_from, date_to, targetologist):
     """
-    Тянем статистику по объявлениям за период [date_from, date_to]
-    c шагом 1 день (time_increment=1) для конкретного account_id.
-    account_id здесь БЕЗ префикса act_ (мы добавим его в URL).
+    Возвращает список строк или None, если запрос упал.
+    account_id — БЕЗ префикса act_
     """
-    print(f"[FB] Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
+    print(f"***FB*** Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
 
     url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}/insights"
 
@@ -137,21 +125,34 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
     }
 
     all_rows = []
+    page = 1
+
     while True:
         resp = requests.get(url, params=params)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"FB API error {resp.status_code} for account {account_id}: {resp.text}"
-            )
 
-        data = resp.json()
+        if resp.status_code != 200:
+            # Логируем ошибку и выходим
+            try:
+                err_json = resp.json()
+            except Exception:
+                err_json = resp.text
+            print(f"***ERROR*** FB API error for account {account_id} ({targetologist}), "
+                  f"status={resp.status_code}, response={err_json}")
+            return None
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            print(f"***ERROR*** Cannot parse JSON for account {account_id} ({targetologist}): {e}")
+            print("Raw response:", resp.text[:500])
+            return None
 
         for item in data.get("data", []):
             dt = parser.isoparse(item["date_start"]).date() if "date_start" in item else None
 
             row = {
                 "date": dt,
-                "account_id": item.get("account_id"),  # это будет тот же ID БЕЗ act_
+                "account_id": item.get("account_id"),
                 "campaign_id": item.get("campaign_id"),
                 "campaign_name": item.get("campaign_name"),
                 "adset_id": item.get("adset_id"),
@@ -175,11 +176,11 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
         if not next_url:
             break
 
-        # при переходе по next параметры уже в URL
         url = next_url
         params = {}
+        page += 1
 
-    print(f"[FB] {account_id} ({targetologist}): {len(all_rows)} rows fetched")
+    print(f"***FB*** {account_id} ({targetologist}): {len(all_rows)} rows fetched")
     return all_rows
 
 
@@ -222,7 +223,7 @@ def upsert_insights(conn, rows):
         execute_values(cur, sql, values, page_size=500)
         conn.commit()
 
-    print(f"[DB] Upserted {len(rows)} rows into fb_insights_daily")
+    print(f"***DB*** Upserted {len(rows)} rows into fb_insights_daily")
 
 
 def main():
@@ -237,7 +238,7 @@ def main():
     ensure_tables(conn)
 
     today = date.today()
-    target_to = today - timedelta(days=1)  # обычно выгружаем до вчера
+    target_to = today - timedelta(days=1)
 
     for cfg in config:
         token = cfg.get("token")
@@ -245,41 +246,55 @@ def main():
         ids = cfg.get("ids", [])
 
         if not token or not ids:
-            print(f"[WARN] Skipping config without token or ids: {cfg}")
+            print(f"***WARN*** Skipping config without token or ids: {cfg}")
             continue
 
         if not targetologist:
             targetologist = "unknown"
 
         for acc in ids:
-            # убираем префикс act_, если есть
             if acc.startswith("act_"):
                 account_id = acc[4:]
             else:
                 account_id = acc
 
-            last = get_watermark(conn, account_id)
-            if last:
-                date_from = last - timedelta(days=RELOAD_LAST_DAYS)
-            else:
-                date_from = today - timedelta(days=DEFAULT_DAYS_BACK)
+            try:
+                last = get_watermark(conn, account_id)
+                if last:
+                    date_from = last - timedelta(days=RELOAD_LAST_DAYS)
+                else:
+                    date_from = today - timedelta(days=DEFAULT_DAYS_BACK)
 
-            if date_from > target_to:
-                print(f"[SKIP] {account_id} ({targetologist}): date_from > date_to")
-                continue
+                if date_from > target_to:
+                    print(f"***SKIP*** {account_id} ({targetologist}): date_from > date_to")
+                    continue
 
-            rows = fetch_insights_for_account(
-                token=token,
-                account_id=account_id,
-                date_from=date_from,
-                date_to=target_to,
-                targetologist=targetologist
-            )
-            upsert_insights(conn, rows)
-            set_watermark(conn, account_id, target_to)
+                rows = fetch_insights_for_account(
+                    token=token,
+                    account_id=account_id,
+                    date_from=date_from,
+                    date_to=target_to,
+                    targetologist=targetologist
+                )
+
+                if rows is None:
+                    print(f"***WARN*** {account_id} ({targetologist}): FB returned error, "
+                          f"skipping upsert and watermark update")
+                    continue
+
+                if not rows:
+                    print(f"***WARN*** {account_id} ({targetologist}): no data, "
+                          f"skipping upsert and watermark update")
+                    continue
+
+                upsert_insights(conn, rows)
+                set_watermark(conn, account_id, target_to)
+
+            except Exception as e:
+                print(f"***ERROR*** Unexpected error for account {account_id} ({targetologist}): {e}")
 
     conn.close()
-    print("[OK] Finished FB → Neon incremental load")
+    print("***OK*** Finished FB → Neon incremental load")
 
 
 if __name__ == "__main__":
