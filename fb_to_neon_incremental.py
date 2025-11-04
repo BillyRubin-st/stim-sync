@@ -5,25 +5,28 @@ import json
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 from dateutil import parser
 
-# ========== CONFIG ==========
-FB_ACCESS_TOKEN = os.getenv("FB_ACCESS_TOKEN")  # long-lived token с правами ads_read
+# ================== CONFIG ==================
+
 FB_API_VERSION = "v17.0"
 
-# Список рекламных аккаунтов через запятую, без act_
-# Пример: FB_AD_ACCOUNTS="1234567890,9876543210"
-AD_ACCOUNTS = [a.strip() for a in os.getenv("FB_AD_ACCOUNTS", "").split(",") if a.strip()]
+# JSON-массив, который ты положишь в секрет FB_CONFIG
+# [
+#   { "token": "...", "targetologist": "aijamal", "ids": ["act_123", ...] },
+#   ...
+# ]
+FB_CONFIG_RAW = os.getenv("FB_CONFIG")
 
-# DSN подключения к Neon (Postgres)
+# DSN для Neon (Postgres)
 # Пример: PG_DSN="host=... port=5432 dbname=... user=... password=..."
 PG_DSN = os.getenv("PG_DSN")
 
-# Сколько дней назад начинать, если watermark ещё нет
-DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "30"))
+# Сколько дней назад тянем историю при ПЕРВОМ запуске (если watermark нет)
+DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "60"))
 
-# Сколько последних дней пересчитывать каждый запуск
+# Сколько последних дней пересчитываем каждый запуск (для корректировок FB)
 RELOAD_LAST_DAYS = int(os.getenv("FB_RELOAD_LAST_DAYS", "3"))
 
 FIELDS = [
@@ -45,7 +48,8 @@ FIELDS = [
     "cpc",
     "cpp"
 ]
-# ============================
+
+# ============================================
 
 
 def get_conn():
@@ -58,23 +62,24 @@ def ensure_tables(conn):
     with conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS fb_insights_daily (
-            date        date                NOT NULL,
-            account_id  text                NOT NULL,
-            campaign_id text,
-            campaign_name text,
-            adset_id    text,
-            adset_name  text,
-            ad_id       text                NOT NULL,
-            ad_name     text,
-            impressions bigint,
-            clicks      bigint,
-            spend       numeric(18,4),
-            reach       bigint,
-            frequency   numeric(10,4),
-            ctr         numeric(10,4),
-            cpc         numeric(18,4),
-            cpp         numeric(18,4),
-            updated_at  timestamptz DEFAULT now(),
+            date           date                NOT NULL,
+            account_id     text                NOT NULL,
+            campaign_id    text,
+            campaign_name  text,
+            adset_id       text,
+            adset_name     text,
+            ad_id          text                NOT NULL,
+            ad_name        text,
+            impressions    bigint,
+            clicks         bigint,
+            spend          numeric(18,4),
+            reach          bigint,
+            frequency      numeric(10,4),
+            ctr            numeric(10,4),
+            cpc            numeric(18,4),
+            cpp            numeric(18,4),
+            targetologist  text,
+            updated_at     timestamptz DEFAULT now(),
             PRIMARY KEY (date, account_id, ad_id)
         );
         """)
@@ -88,7 +93,7 @@ def ensure_tables(conn):
         conn.commit()
 
 
-def get_watermark(conn, account_id: str) -> date | None:
+def get_watermark(conn, account_id):
     with conn.cursor() as cur:
         cur.execute("SELECT last_date FROM fb_watermark WHERE account_id = %s", (account_id,))
         row = cur.fetchone()
@@ -97,7 +102,7 @@ def get_watermark(conn, account_id: str) -> date | None:
     return None
 
 
-def set_watermark(conn, account_id: str, last_date: date):
+def set_watermark(conn, account_id, last_date):
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO fb_watermark (account_id, last_date, updated_at)
@@ -109,17 +114,18 @@ def set_watermark(conn, account_id: str, last_date: date):
         conn.commit()
 
 
-def fetch_insights(account_id: str, date_from: date, date_to: date):
+def fetch_insights_for_account(token, account_id, date_from, date_to, targetologist):
     """
     Тянем статистику по объявлениям за период [date_from, date_to]
-    с шагом 1 день (time_increment=1).
+    c шагом 1 день (time_increment=1) для конкретного account_id.
+    account_id здесь БЕЗ префикса act_ (мы добавим его в URL).
     """
-    print(f"[FB] Fetching {account_id} from {date_from} to {date_to}")
+    print(f"[FB] Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
 
     url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}/insights"
 
     params = {
-        "access_token": FB_ACCESS_TOKEN,
+        "access_token": token,
         "time_range": json.dumps({
             "since": date_from.isoformat(),
             "until": date_to.isoformat()
@@ -134,16 +140,18 @@ def fetch_insights(account_id: str, date_from: date, date_to: date):
     while True:
         resp = requests.get(url, params=params)
         if resp.status_code != 200:
-            raise RuntimeError(f"FB API error {resp.status_code}: {resp.text}")
+            raise RuntimeError(
+                f"FB API error {resp.status_code} for account {account_id}: {resp.text}"
+            )
 
         data = resp.json()
 
         for item in data.get("data", []):
-            row_date = parser.isoparse(item["date_start"]).date() if "date_start" in item else None
+            dt = parser.isoparse(item["date_start"]).date() if "date_start" in item else None
 
             row = {
-                "date": row_date,
-                "account_id": item.get("account_id"),
+                "date": dt,
+                "account_id": item.get("account_id"),  # это будет тот же ID БЕЗ act_
                 "campaign_id": item.get("campaign_id"),
                 "campaign_name": item.get("campaign_name"),
                 "adset_id": item.get("adset_id"),
@@ -158,6 +166,7 @@ def fetch_insights(account_id: str, date_from: date, date_to: date):
                 "ctr": float(item.get("ctr") or 0) if item.get("ctr") else None,
                 "cpc": float(item.get("cpc") or 0) if item.get("cpc") else None,
                 "cpp": float(item.get("cpp") or 0) if item.get("cpp") else None,
+                "targetologist": targetologist
             }
             all_rows.append(row)
 
@@ -165,11 +174,12 @@ def fetch_insights(account_id: str, date_from: date, date_to: date):
         next_url = paging.get("next")
         if not next_url:
             break
-        # Для next запросов параметры уже внутри URL
-        params = {}
-        url = next_url
 
-    print(f"[FB] {account_id}: fetched {len(all_rows)} rows")
+        # при переходе по next параметры уже в URL
+        url = next_url
+        params = {}
+
+    print(f"[FB] {account_id} ({targetologist}): {len(all_rows)} rows fetched")
     return all_rows
 
 
@@ -181,8 +191,10 @@ def upsert_insights(conn, rows):
         "date", "account_id", "campaign_id", "campaign_name",
         "adset_id", "adset_name", "ad_id", "ad_name",
         "impressions", "clicks", "spend", "reach",
-        "frequency", "ctr", "cpc", "cpp"
+        "frequency", "ctr", "cpc", "cpp",
+        "targetologist"
     ]
+
     values = [[r[c] for c in cols] for r in rows]
 
     with conn.cursor() as cur:
@@ -191,55 +203,83 @@ def upsert_insights(conn, rows):
         VALUES %s
         ON CONFLICT (date, account_id, ad_id) DO UPDATE
         SET
-            campaign_id = EXCLUDED.campaign_id,
+            campaign_id   = EXCLUDED.campaign_id,
             campaign_name = EXCLUDED.campaign_name,
-            adset_id = EXCLUDED.adset_id,
-            adset_name = EXCLUDED.adset_name,
-            ad_name = EXCLUDED.ad_name,
-            impressions = EXCLUDED.impressions,
-            clicks = EXCLUDED.clicks,
-            spend = EXCLUDED.spend,
-            reach = EXCLUDED.reach,
-            frequency = EXCLUDED.frequency,
-            ctr = EXCLUDED.ctr,
-            cpc = EXCLUDED.cpc,
-            cpp = EXCLUDED.cpp,
-            updated_at = now();
+            adset_id      = EXCLUDED.adset_id,
+            adset_name    = EXCLUDED.adset_name,
+            ad_name       = EXCLUDED.ad_name,
+            impressions   = EXCLUDED.impressions,
+            clicks        = EXCLUDED.clicks,
+            spend         = EXCLUDED.spend,
+            reach         = EXCLUDED.reach,
+            frequency     = EXCLUDED.frequency,
+            ctr           = EXCLUDED.ctr,
+            cpc           = EXCLUDED.cpc,
+            cpp           = EXCLUDED.cpp,
+            targetologist = EXCLUDED.targetologist,
+            updated_at    = now();
         """
         execute_values(cur, sql, values, page_size=500)
         conn.commit()
+
     print(f"[DB] Upserted {len(rows)} rows into fb_insights_daily")
 
 
 def main():
-    if not FB_ACCESS_TOKEN:
-        raise RuntimeError("FB_ACCESS_TOKEN is not set")
-    if not AD_ACCOUNTS:
-        raise RuntimeError("FB_AD_ACCOUNTS is not set or empty")
+    if not FB_CONFIG_RAW:
+        raise RuntimeError("FB_CONFIG is not set")
+
+    config = json.loads(FB_CONFIG_RAW)
+    if not isinstance(config, list) or not config:
+        raise RuntimeError("FB_CONFIG must be a non-empty JSON array")
 
     conn = get_conn()
     ensure_tables(conn)
 
     today = date.today()
-    target_to = today - timedelta(days=1)  # до вчера
+    target_to = today - timedelta(days=1)  # обычно выгружаем до вчера
 
-    for account_id in AD_ACCOUNTS:
-        last = get_watermark(conn, account_id)
-        if last:
-            date_from = last - timedelta(days=RELOAD_LAST_DAYS)
-        else:
-            date_from = today - timedelta(days=DEFAULT_DAYS_BACK)
+    for cfg in config:
+        token = cfg.get("token")
+        targetologist = cfg.get("targetologist")
+        ids = cfg.get("ids", [])
 
-        if date_from > target_to:
-            print(f"[SKIP] {account_id}: nothing to load (date_from > date_to)")
+        if not token or not ids:
+            print(f"[WARN] Skipping config without token or ids: {cfg}")
             continue
 
-        rows = fetch_insights(account_id, date_from, target_to)
-        upsert_insights(conn, rows)
-        set_watermark(conn, account_id, target_to)
+        if not targetologist:
+            targetologist = "unknown"
+
+        for acc in ids:
+            # убираем префикс act_, если есть
+            if acc.startswith("act_"):
+                account_id = acc[4:]
+            else:
+                account_id = acc
+
+            last = get_watermark(conn, account_id)
+            if last:
+                date_from = last - timedelta(days=RELOAD_LAST_DAYS)
+            else:
+                date_from = today - timedelta(days=DEFAULT_DAYS_BACK)
+
+            if date_from > target_to:
+                print(f"[SKIP] {account_id} ({targetologist}): date_from > date_to")
+                continue
+
+            rows = fetch_insights_for_account(
+                token=token,
+                account_id=account_id,
+                date_from=date_from,
+                date_to=target_to,
+                targetologist=targetologist
+            )
+            upsert_insights(conn, rows)
+            set_watermark(conn, account_id, target_to)
 
     conn.close()
-    print("[OK] Finished incremental load")
+    print("[OK] Finished FB → Neon incremental load")
 
 
 if __name__ == "__main__":
