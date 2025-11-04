@@ -1,0 +1,32 @@
+name: FB to Neon ETL
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # каждый день в 01:00 UTC
+  workflow_dispatch:      # возможность ручного запуска
+
+jobs:
+  fb-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests psycopg2-binary python-dateutil
+
+      - name: Run FB incremental ETL to Neon
+        env:
+          FB_CONFIG: ${{ secrets.FB_CONFIG }}
+          PG_DSN: ${{ secrets.NEON_PG_DSN }}
+          FB_DEFAULT_DAYS_BACK: "60"
+          FB_RELOAD_LAST_DAYS: "3"
+        run: |
+          python fb_to_neon_incremental.py
