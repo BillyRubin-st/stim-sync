@@ -24,7 +24,7 @@ PG_DSN = os.getenv("PG_DSN")
 DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "60"))
 
 # Сколько последних дней пересчитывать при каждом запуске (на случай корректировок в FB).
-RELOAD_LAST_DAYS = int(os.getenv("FB_RELOAD_LAST_DAYS", "3"))
+RELOAD_LAST_DAYS = 1
 
 # Поля для insights.
 FIELDS = [
@@ -271,7 +271,7 @@ def main():
     ensure_tables(conn)
 
     today = date.today()
-    target_to = today - timedelta(days=1)  # обычно тянем до вчера
+    target_to = today  # тянем включая сегодняшний день
 
     for cfg in config:
         token = cfg.get("token")
