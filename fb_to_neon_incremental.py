@@ -298,4 +298,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        exit(0)
+    except Exception as e:
+        print(f"***FATAL*** Unhandled error: {e}")
+        exit(0)
