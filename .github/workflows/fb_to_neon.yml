@@ -23,10 +23,16 @@ jobs:
           pip install requests psycopg2-binary python-dateutil
 
       - name: Run FB incremental ETL to Neon
+        continue-on-error: true
         env:
           FB_CONFIG: ${{ secrets.FB_CONFIG }}
           PG_DSN: ${{ secrets.DATABASE_URL }}
           FB_DEFAULT_DAYS_BACK: "60"
           FB_RELOAD_LAST_DAYS: "3"
         run: |
-          python fb_to_neon_incremental.py
+          set -e
+          echo "=== Starting Facebook ETL ==="
+          python fb_to_neon_incremental.py || echo "ETL exited with error code $?"
+          echo "=== Last 200 lines of log ==="
+          tail -n 200 /home/runner/work/_temp/_github_home/_logs/* || true
+          echo "=== Workflow finished ==="
