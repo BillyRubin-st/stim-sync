@@ -115,17 +115,32 @@ def set_watermark(conn, account_id, last_date):
         conn.commit()
 
 
+def get_account_name(token, account_id):
+    """Возвращает имя рекламного аккаунта по его ID"""
+    url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}"
+    params = {
+        "access_token": token,
+        "fields": "name"
+    }
+    resp = requests.get(url, params=params)
+    if resp.status_code == 200:
+        try:
+            return resp.json().get("name")
+        except Exception:
+            return None
+    print(f"***WARN*** Cannot fetch account name for {account_id}, status={resp.status_code}")
+    return None
+
+
 def fetch_insights_for_account(token, account_id, date_from, date_to, targetologist):
     """
     Тянем статистику по объявлениям за период [date_from, date_to]
-    c шагом 1 день (time_increment=1) для конкретного account_id.
-    account_id — БЕЗ префикса act_.
-    Возвращаем список строк или None, если запрос упал.
     """
     print(f"***FB*** Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
 
-    url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}/insights"
+    account_name = get_account_name(token, account_id)
 
+    url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}/insights"
     params = {
         "access_token": token,
         "time_range": json.dumps({
@@ -139,13 +154,10 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
     }
 
     all_rows = []
-    page = 1
-
     while True:
         resp = requests.get(url, params=params)
 
         if resp.status_code != 200:
-            # Логируем ошибку и выходим
             try:
                 err_json = resp.json()
             except Exception:
@@ -154,19 +166,14 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
                   f"status={resp.status_code}, response={err_json}")
             return None
 
-        try:
-            data = resp.json()
-        except Exception as e:
-            print(f"***ERROR*** Cannot parse JSON for account {account_id} ({targetologist}): {e}")
-            print("Raw response:", resp.text[:500])
-            return None
-
+        data = resp.json()
         for item in data.get("data", []):
-            dt = parser.isoparse(item["date_start"]).date() if "date_start" in item else None
+            dt = parser.isoparse(item["date_start"]).date()
 
             row = {
                 "date": dt,
                 "account_id": item.get("account_id"),
+                "account_name": account_name,   # 👈 добавили
                 "campaign_id": item.get("campaign_id"),
                 "campaign_name": item.get("campaign_name"),
                 "adset_id": item.get("adset_id"),
@@ -185,29 +192,39 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
             }
             all_rows.append(row)
 
-        paging = data.get("paging", {})
-        next_url = paging.get("next")
+        next_url = data.get("paging", {}).get("next")
         if not next_url:
             break
-
         url = next_url
         params = {}
-        page += 1
 
     print(f"***FB*** {account_id} ({targetologist}): {len(all_rows)} rows fetched")
     return all_rows
 
 
+
 def upsert_insights(conn, rows):
-    """Upsert строк в fb_insights_daily."""
     if not rows:
         return
 
     cols = [
-        "date", "account_id", "campaign_id", "campaign_name",
-        "adset_id", "adset_name", "ad_id", "ad_name",
-        "impressions", "clicks", "spend", "reach",
-        "frequency", "ctr", "cpc", "cpp",
+        "date",
+        "account_id",
+        "account_name",      # 👈 добавили сюда
+        "campaign_id",
+        "campaign_name",
+        "adset_id",
+        "adset_name",
+        "ad_id",
+        "ad_name",
+        "impressions",
+        "clicks",
+        "spend",
+        "reach",
+        "frequency",
+        "ctr",
+        "cpc",
+        "cpp",
         "targetologist"
     ]
 
@@ -219,6 +236,7 @@ def upsert_insights(conn, rows):
         VALUES %s
         ON CONFLICT (date, account_id, ad_id) DO UPDATE
         SET
+            account_name  = EXCLUDED.account_name,   -- 👈 вот эта строка
             campaign_id   = EXCLUDED.campaign_id,
             campaign_name = EXCLUDED.campaign_name,
             adset_id      = EXCLUDED.adset_id,
