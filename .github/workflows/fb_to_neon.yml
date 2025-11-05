@@ -2,8 +2,8 @@ name: FB to Neon ETL
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # каждый день в 01:00 UTC
-  workflow_dispatch:      # возможность ручного запуска руками
+    - cron: "*/30 * * * *"   # каждые 30 минут (UTC)
+  workflow_dispatch:   
 
 jobs:
   fb-etl:
