@@ -1,5 +1,3 @@
-# fb_to_neon_incremental.py
-
 import os
 import json
 import requests
@@ -17,20 +15,20 @@ FB_API_VERSION = "v17.0"
 FB_CONFIG_RAW = os.getenv("FB_CONFIG")
 
 # Строка подключения к Neon (Postgres).
-# Берётся из переменной PG_DSN (в workflow мы подставим secrets.DATABASE_URL).
-PG_DSN = os.getenv("PG_DSN")
+# В workflow мы передаём её через secrets.DATABASE_URL → PG_DSN.
+PG_DSN = os.getenv("PG_DSN") or os.getenv("DATABASE_URL")
 
 # Сколько дней истории тянуть при первом запуске (если watermark ещё нет).
 DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "60"))
 
-# Сколько последних дней пересчитывать при каждом запуске (на случай корректировок в FB).
-RELOAD_LAST_DAYS = 1
+# Сколько последних дней пересчитывать при каждом запуске.
+RELOAD_LAST_DAYS = int(os.getenv("FB_RELOAD_LAST_DAYS", "3"))
 
-# Поля для insights.
+# Поля для insights
 FIELDS = [
     "date_start",
-    "date_stop",
     "account_id",
+    "account_name",
     "campaign_id",
     "campaign_name",
     "adset_id",
@@ -44,25 +42,27 @@ FIELDS = [
     "frequency",
     "ctr",
     "cpc",
-    "cpp"
+    "cpp",
+    "actions"   # 👈 здесь заберём лиды
 ]
 
-# ============================================
+# ================== DB HELPERS ==================
 
 
 def get_conn():
     if not PG_DSN:
-        raise RuntimeError("PG_DSN is not set")
+        raise RuntimeError("PG_DSN / DATABASE_URL is not set")
     return psycopg2.connect(PG_DSN)
 
 
 def ensure_tables(conn):
-    """Создаём таблицы, если их ещё нет."""
+    """Создаём/обновляем таблицы, если их ещё нет."""
     with conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS fb_insights_daily (
             date           date                NOT NULL,
             account_id     text                NOT NULL,
+            account_name   text,
             campaign_id    text,
             campaign_name  text,
             adset_id       text,
@@ -71,6 +71,7 @@ def ensure_tables(conn):
             ad_name        text,
             impressions    bigint,
             clicks         bigint,
+            leads          bigint,
             spend          numeric(18,4),
             reach          bigint,
             frequency      numeric(10,4),
@@ -82,6 +83,10 @@ def ensure_tables(conn):
             PRIMARY KEY (date, account_id, ad_id)
         );
         """)
+        # на случай, если таблица уже существовала раньше без новых колонок
+        cur.execute("ALTER TABLE fb_insights_daily ADD COLUMN IF NOT EXISTS account_name text;")
+        cur.execute("ALTER TABLE fb_insights_daily ADD COLUMN IF NOT EXISTS leads bigint;")
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS fb_watermark (
             account_id text PRIMARY KEY,
@@ -93,7 +98,6 @@ def ensure_tables(conn):
 
 
 def get_watermark(conn, account_id):
-    """Читаем последнюю загруженную дату для аккаунта."""
     with conn.cursor() as cur:
         cur.execute("SELECT last_date FROM fb_watermark WHERE account_id = %s", (account_id,))
         row = cur.fetchone()
@@ -103,7 +107,6 @@ def get_watermark(conn, account_id):
 
 
 def set_watermark(conn, account_id, last_date):
-    """Обновляем watermark по аккаунту."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO fb_watermark (account_id, last_date, updated_at)
@@ -115,32 +118,43 @@ def set_watermark(conn, account_id, last_date):
         conn.commit()
 
 
-def get_account_name(token, account_id):
-    """Возвращает имя рекламного аккаунта по его ID"""
-    url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}"
-    params = {
-        "access_token": token,
-        "fields": "name"
-    }
-    resp = requests.get(url, params=params)
-    if resp.status_code == 200:
-        try:
-            return resp.json().get("name")
-        except Exception:
-            return None
-    print(f"***WARN*** Cannot fetch account name for {account_id}, status={resp.status_code}")
-    return None
+# ================== FB HELPERS ==================
+
+
+def extract_leads(actions):
+    """
+    actions — список словарей вида:
+    [{"action_type": "lead", "value": "3"}, ...]
+    Суммируем все, что относится к лидам.
+    """
+    if not actions:
+        return 0
+
+    total = 0
+    for a in actions:
+        t = a.get("action_type")
+        if t in (
+            "lead",
+            "onsite_conversion.lead_grouped",
+            "offsite_conversion.fb_pixel_lead",
+            "offsite_conversion.lead"
+        ):
+            try:
+                total += int(a.get("value") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 def fetch_insights_for_account(token, account_id, date_from, date_to, targetologist):
     """
     Тянем статистику по объявлениям за период [date_from, date_to]
+    c шагом 1 день (time_increment=1) для конкретного account_id.
     """
     print(f"***FB*** Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
 
-    account_name = get_account_name(token, account_id)
-
     url = f"https://graph.facebook.com/{FB_API_VERSION}/act_{account_id}/insights"
+
     params = {
         "access_token": token,
         "time_range": json.dumps({
@@ -154,6 +168,8 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
     }
 
     all_rows = []
+    page = 1
+
     while True:
         resp = requests.get(url, params=params)
 
@@ -166,14 +182,22 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
                   f"status={resp.status_code}, response={err_json}")
             return None
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception as e:
+            print(f"***ERROR*** Cannot parse JSON for account {account_id} ({targetologist}): {e}")
+            print("Raw response:", resp.text[:500])
+            return None
+
         for item in data.get("data", []):
-            dt = parser.isoparse(item["date_start"]).date()
+            dt = parser.isoparse(item["date_start"]).date() if "date_start" in item else None
+
+            leads = extract_leads(item.get("actions"))
 
             row = {
                 "date": dt,
                 "account_id": item.get("account_id"),
-                "account_name": account_name,   # 👈 добавили
+                "account_name": item.get("account_name"),
                 "campaign_id": item.get("campaign_id"),
                 "campaign_name": item.get("campaign_name"),
                 "adset_id": item.get("adset_id"),
@@ -182,6 +206,7 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
                 "ad_name": item.get("ad_name"),
                 "impressions": int(item.get("impressions") or 0),
                 "clicks": int(item.get("clicks") or 0),
+                "leads": leads,
                 "spend": float(item.get("spend") or 0),
                 "reach": int(item.get("reach") or 0) if item.get("reach") else None,
                 "frequency": float(item.get("frequency") or 0) if item.get("frequency") else None,
@@ -192,25 +217,28 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
             }
             all_rows.append(row)
 
-        next_url = data.get("paging", {}).get("next")
+        paging = data.get("paging", {})
+        next_url = paging.get("next")
         if not next_url:
             break
+
         url = next_url
         params = {}
+        page += 1
 
     print(f"***FB*** {account_id} ({targetologist}): {len(all_rows)} rows fetched")
     return all_rows
 
 
-
 def upsert_insights(conn, rows):
+    """Upsert строк в fb_insights_daily."""
     if not rows:
         return
 
     cols = [
         "date",
         "account_id",
-        "account_name",      # 👈 добавили сюда
+        "account_name",
         "campaign_id",
         "campaign_name",
         "adset_id",
@@ -219,6 +247,7 @@ def upsert_insights(conn, rows):
         "ad_name",
         "impressions",
         "clicks",
+        "leads",
         "spend",
         "reach",
         "frequency",
@@ -236,7 +265,7 @@ def upsert_insights(conn, rows):
         VALUES %s
         ON CONFLICT (date, account_id, ad_id) DO UPDATE
         SET
-            account_name  = EXCLUDED.account_name,   -- 👈 вот эта строка
+            account_name  = EXCLUDED.account_name,
             campaign_id   = EXCLUDED.campaign_id,
             campaign_name = EXCLUDED.campaign_name,
             adset_id      = EXCLUDED.adset_id,
@@ -244,6 +273,7 @@ def upsert_insights(conn, rows):
             ad_name       = EXCLUDED.ad_name,
             impressions   = EXCLUDED.impressions,
             clicks        = EXCLUDED.clicks,
+            leads         = EXCLUDED.leads,
             spend         = EXCLUDED.spend,
             reach         = EXCLUDED.reach,
             frequency     = EXCLUDED.frequency,
@@ -257,6 +287,9 @@ def upsert_insights(conn, rows):
         conn.commit()
 
     print(f"***DB*** Upserted {len(rows)} rows into fb_insights_daily")
+
+
+# ================== MAIN ==================
 
 
 def main():
@@ -275,15 +308,12 @@ def main():
 
     for cfg in config:
         token = cfg.get("token")
-        targetologist = cfg.get("targetologist")
+        targetologist = cfg.get("targetologist") or "unknown"
         ids = cfg.get("ids", [])
 
         if not token or not ids:
             print(f"***WARN*** Skipping config without token or ids: {cfg}")
             continue
-
-        if not targetologist:
-            targetologist = "unknown"
 
         for acc in ids:
             # убираем префикс act_, если есть
@@ -328,7 +358,7 @@ def main():
                 print(f"***ERROR*** Unexpected error for account {account_id} ({targetologist}): {e}")
 
     conn.close()
-    print("***OK*** Finished FB → Neon incremental load")
+    print("***OK*** Finished FB → Neon incremental load with leads")
 
 
 if __name__ == "__main__":
