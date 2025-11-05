@@ -12,12 +12,21 @@ from dateutil import parser
 
 FB_API_VERSION = "v17.0"
 
+# JSON-массив с токенами, таргетологами и списком аккаунтов.
+# Берётся из переменной окружения FB_CONFIG (GitHub Secret).
 FB_CONFIG_RAW = os.getenv("FB_CONFIG")
+
+# Строка подключения к Neon (Postgres).
+# Берётся из переменной PG_DSN (в workflow мы подставим secrets.DATABASE_URL).
 PG_DSN = os.getenv("PG_DSN")
 
+# Сколько дней истории тянуть при первом запуске (если watermark ещё нет).
 DEFAULT_DAYS_BACK = int(os.getenv("FB_DEFAULT_DAYS_BACK", "60"))
+
+# Сколько последних дней пересчитывать при каждом запуске (на случай корректировок в FB).
 RELOAD_LAST_DAYS = int(os.getenv("FB_RELOAD_LAST_DAYS", "3"))
 
+# Поля для insights.
 FIELDS = [
     "date_start",
     "date_stop",
@@ -48,6 +57,7 @@ def get_conn():
 
 
 def ensure_tables(conn):
+    """Создаём таблицы, если их ещё нет."""
     with conn.cursor() as cur:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS fb_insights_daily (
@@ -83,6 +93,7 @@ def ensure_tables(conn):
 
 
 def get_watermark(conn, account_id):
+    """Читаем последнюю загруженную дату для аккаунта."""
     with conn.cursor() as cur:
         cur.execute("SELECT last_date FROM fb_watermark WHERE account_id = %s", (account_id,))
         row = cur.fetchone()
@@ -92,6 +103,7 @@ def get_watermark(conn, account_id):
 
 
 def set_watermark(conn, account_id, last_date):
+    """Обновляем watermark по аккаунту."""
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO fb_watermark (account_id, last_date, updated_at)
@@ -105,8 +117,10 @@ def set_watermark(conn, account_id, last_date):
 
 def fetch_insights_for_account(token, account_id, date_from, date_to, targetologist):
     """
-    Возвращает список строк или None, если запрос упал.
-    account_id — БЕЗ префикса act_
+    Тянем статистику по объявлениям за период [date_from, date_to]
+    c шагом 1 день (time_increment=1) для конкретного account_id.
+    account_id — БЕЗ префикса act_.
+    Возвращаем список строк или None, если запрос упал.
     """
     print(f"***FB*** Fetch {account_id} ({targetologist}) from {date_from} to {date_to}")
 
@@ -185,6 +199,7 @@ def fetch_insights_for_account(token, account_id, date_from, date_to, targetolog
 
 
 def upsert_insights(conn, rows):
+    """Upsert строк в fb_insights_daily."""
     if not rows:
         return
 
@@ -238,7 +253,7 @@ def main():
     ensure_tables(conn)
 
     today = date.today()
-    target_to = today - timedelta(days=1)
+    target_to = today - timedelta(days=1)  # обычно тянем до вчера
 
     for cfg in config:
         token = cfg.get("token")
@@ -253,6 +268,7 @@ def main():
             targetologist = "unknown"
 
         for acc in ids:
+            # убираем префикс act_, если есть
             if acc.startswith("act_"):
                 account_id = acc[4:]
             else:
@@ -298,9 +314,4 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-        exit(0)
-    except Exception as e:
-        print(f"***FATAL*** Unhandled error: {e}")
-        exit(0)
+    main()
