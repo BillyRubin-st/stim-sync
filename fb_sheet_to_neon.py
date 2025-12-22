@@ -1,3 +1,11 @@
+# fb_sheet_to_neon.py
+# Google Sheets (published CSV) -> Neon (Postgres) UPSERT
+# Robust to:
+# - UTF-8 BOM / encoding issues
+# - delimiter , or ;
+# - header variations (spaces/BOM/newlines)
+# - percent values like "3,15%" (stores as 3.15)
+
 import os
 import csv
 import io
@@ -8,149 +16,123 @@ import psycopg2
 CSV_URL = os.environ["SHEETS_CSV_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+
 def norm(s: str) -> str:
-    # убираем BOM, пробелы, переносы
+    """Normalize header/value strings: remove BOM, trim spaces/newlines."""
     return (s or "").replace("\ufeff", "").strip()
 
+
 def to_int(x):
-    if x in (None, ""): return None
+    if x is None:
+        return None
+    s = str(x).strip().replace(" ", "")
+    if s == "":
+        return None
     try:
-        return int(float(str(x).replace(" ", "").replace(",", ".")))
-    except:
+        return int(float(s.replace(",", ".")))
+    except Exception:
         return None
 
+
 def to_num(x):
-    def to_num(x):
+    """Parse numbers like: 1.23 / 1,23 / 3,15% / 0 / '' -> float or None.
+    For percent values, we keep 3.15 (NOT 0.0315).
+    """
     if x is None:
         return None
     s = str(x).strip().replace(" ", "")
     if s == "":
         return None
 
-    # убираем знак процента
-    is_percent = False
+    # remove percent sign
     if s.endswith("%"):
-        is_percent = True
         s = s[:-1]
 
-    # заменяем запятую на точку
     s = s.replace(",", ".")
-
     try:
-        val = float(s)
-        # оставляем как "3.15", не переводим в 0.0315 (для DataLens удобнее в процентах)
-        return val
-    except:
+        return float(s)
+    except Exception:
         return None
 
 
 def to_date_iso(x):
+    """Parse date like '22.12.2025' -> '2025-12-22'."""
     s = norm(str(x)) if x is not None else ""
-    if not s: return None
+    if not s:
+        return None
     try:
         dt = dateparser.parse(s, dayfirst=True)
         return dt.date().isoformat()
-    except:
+    except Exception:
         return None
 
-def main():
-    r = requests.get(CSV_URL, timeout=60)
+
+def fetch_csv_text(url: str) -> str:
+    r = requests.get(url, timeout=60)
     r.raise_for_status()
-    
-    # принудительно декодируем как UTF-8 (Google Sheets CSV обычно UTF-8)
+
+    # Decode as UTF-8 reliably (avoid r.text auto-decoding issues)
     content = r.content
-    # убираем BOM если есть
-    if content.startswith(b"\xef\xbb\xbf"):
+    if content.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
         content = content[3:]
-    
-    text = content.decode("utf-8", errors="replace")
+    return content.decode("utf-8", errors="replace")
 
 
-    # пробуем стандартную запятую, если не распарсилось — пробуем ; (часто в RU локали)
-    def parse_with(delim):
-        return csv.DictReader(io.StringIO(text), delimiter=delim)
-
-    reader = parse_with(",")
+def make_reader(csv_text: str) -> csv.DictReader:
+    """Try comma delimiter first; if looks wrong, try semicolon."""
+    # comma
+    reader = csv.DictReader(io.StringIO(csv_text), delimiter=",")
     if not reader.fieldnames or len(reader.fieldnames) <= 1:
-        reader = parse_with(";")
+        # semicolon (common in RU locales)
+        reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
+    return reader
 
-    # нормализуем заголовки
-    raw_headers = reader.fieldnames or []
-    headers = [norm(h) for h in raw_headers]
-    print("HEADERS:", headers)
 
-    # создаём мапу "нормализованный заголовок" -> "как в CSV реально"
-    header_map = {norm(h): h for h in raw_headers}
+def build_header_map(fieldnames):
+    """Map normalized header -> original header from CSV."""
+    raw = fieldnames or []
+    return {norm(h): h for h in raw}
 
-    def get(row, key):
-        # key — ожидаемое имя (например "Дата"), находим реальное
-        real = header_map.get(key)
-        if real is None:
-            return None
-        return row.get(real)
 
-    # проверяем обязательные колонки (по нормализованным именам)
-    required = ["Название аккаунта", "Кампания", "Дата"]
-    missing = [c for c in required if c not in header_map]
-    if missing:
-        raise RuntimeError(f"Нет колонки(ок): {missing}. Реальные заголовки: {headers}")
+def get_cell(row: dict, header_map: dict, *keys: str):
+    """Return cell by trying multiple normalized header keys."""
+    for k in keys:
+        real = header_map.get(k)
+        if real is not None:
+            return row.get(real)
+    return None
 
-    rows = []
-    for row in reader:
-        date = to_date_iso(get(row, "Дата"))
-        acc = norm(get(row, "Название аккаунта"))
-        camp = norm(get(row, "Кампания"))
-        if not date or not acc or not camp:
-            continue
 
-        rows.append({
-            "date": date,
-            "account_name": acc,
-            "campaign": camp,
-            "leads": to_int(get(row, "Лиды")),
-            "spend": to_num(get(row, "Затраты")),
-            "cpl": to_num(get(row, "Цена за лид")),
-            "reach": to_int(get(row, "Охваты")),
-            "impressions": to_int(get(row, "Показы")),
-            "link_clicks": to_int(get(row, "Клики по ссылке")),
-            "cpm": to_num(get(row, "CPM")),
-            "ctr": to_num(get(row, "CTR (%)")),
-            "cr": to_num(get(row, "CR (%)")),
-        })
+def ensure_table(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fb_ads_daily (
+          date date NOT NULL,
+          account_name text NOT NULL,
+          campaign text NOT NULL,
+          leads integer,
+          spend numeric,
+          cpl numeric,
+          reach integer,
+          impressions integer,
+          link_clicks integer,
+          cpm numeric,
+          ctr numeric,
+          cr numeric,
+          updated_at timestamptz,
+          PRIMARY KEY (date, account_name, campaign)
+        );
+        """
+    )
 
-    if not rows:
-        print("Нет данных для загрузки")
-        return
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS fb_ads_daily (
-      date date NOT NULL,
-      account_name text NOT NULL,
-      campaign text NOT NULL,
-      leads integer,
-      spend numeric,
-      cpl numeric,
-      reach integer,
-      impressions integer,
-      link_clicks integer,
-      cpm numeric,
-      ctr numeric,
-      cr numeric,
-      updated_at timestamptz,
-      PRIMARY KEY (date, account_name, campaign)
-    );
-    """)
-
+def upsert_rows(cur, rows):
     sql = """
     INSERT INTO fb_ads_daily
-    (date, account_name, campaign, leads, spend, cpl, reach, impressions,
-     link_clicks, cpm, ctr, cr, updated_at)
+      (date, account_name, campaign, leads, spend, cpl, reach, impressions, link_clicks, cpm, ctr, cr, updated_at)
     VALUES
-    (%(date)s,%(account_name)s,%(campaign)s,%(leads)s,%(spend)s,%(cpl)s,
-     %(reach)s,%(impressions)s,%(link_clicks)s,%(cpm)s,%(ctr)s,%(cr)s, NOW())
+      (%(date)s, %(account_name)s, %(campaign)s, %(leads)s, %(spend)s, %(cpl)s, %(reach)s,
+       %(impressions)s, %(link_clicks)s, %(cpm)s, %(ctr)s, %(cr)s, NOW())
     ON CONFLICT (date, account_name, campaign)
     DO UPDATE SET
       leads = EXCLUDED.leads,
@@ -164,14 +146,105 @@ def main():
       cr = EXCLUDED.cr,
       updated_at = NOW();
     """
-
     for r in rows:
         cur.execute(sql, r)
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    print(f"OK: {len(rows)} строк обновлено")
+
+def main():
+    csv_text = fetch_csv_text(CSV_URL)
+    reader = make_reader(csv_text)
+
+    raw_headers = reader.fieldnames or []
+    headers_norm = [norm(h) for h in raw_headers]
+    header_map = build_header_map(raw_headers)
+
+    print("HEADERS:", headers_norm)
+
+    # Required columns (with tolerant mapping):
+    # - account: "Название аккаунта" (may have extra spaces/BOM)
+    # - campaign: "Кампания"
+    # - date: "Дата" OR "Дата начала" (fallback)
+    required_any = {
+        "account": ("Название аккаунта",),
+        "campaign": ("Кампания",),
+        "date": ("Дата", "Дата начала"),
+    }
+
+    missing = []
+    for name, keys in required_any.items():
+        found = any(k in header_map for k in keys)
+        if not found:
+            missing.append(list(keys))
+
+    if missing:
+        raise RuntimeError(f"Нет колонки(ок): {missing}. Реальные заголовки: {headers_norm}")
+
+    rows = []
+    for row in reader:
+        date_val = get_cell(row, header_map, "Дата", "Дата начала")
+        acc_val = get_cell(row, header_map, "Название аккаунта")
+        camp_val = get_cell(row, header_map, "Кампания")
+
+        date = to_date_iso(date_val)
+        account = norm(str(acc_val)) if acc_val is not None else ""
+        campaign = norm(str(camp_val)) if camp_val is not None else ""
+
+        if not date or not account or not campaign:
+            continue
+
+        leads = to_int(get_cell(row, header_map, "Лиды"))
+        spend = to_num(get_cell(row, header_map, "Затраты"))
+        cpl = to_num(get_cell(row, header_map, "Цена за лид"))
+        reach = to_int(get_cell(row, header_map, "Охваты"))
+        impressions = to_int(get_cell(row, header_map, "Показы"))
+
+        # Clicks column names might vary
+        link_clicks = to_int(
+            get_cell(row, header_map, "Клики по ссылке", "Клики по ссыл.", "Клики", "Link clicks", "link_clicks")
+        )
+
+        cpm = to_num(get_cell(row, header_map, "CPM", "Cpm", "cpm"))
+
+        # CTR/CR headers may vary; value might contain %
+        ctr = to_num(get_cell(row, header_map, "CTR (%)", "CTR(%)", "CTR %", "CTR", "ctr"))
+        cr = to_num(get_cell(row, header_map, "CR (%)", "CR(%)", "CR %", "CR", "cr"))
+
+        rows.append(
+            {
+                "date": date,
+                "account_name": account,
+                "campaign": campaign,
+                "leads": leads,
+                "spend": spend,
+                "cpl": cpl,
+                "reach": reach,
+                "impressions": impressions,
+                "link_clicks": link_clicks,
+                "cpm": cpm,
+                "ctr": ctr,
+                "cr": cr,
+            }
+        )
+
+    if not rows:
+        print("Нет данных для загрузки (0 строк).")
+        return
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+        ensure_table(cur)
+        upsert_rows(cur, rows)
+        conn.commit()
+        cur.close()
+        print(f"OK: upserted {len(rows)} rows")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 if __name__ == "__main__":
     main()
