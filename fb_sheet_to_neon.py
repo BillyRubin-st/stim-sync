@@ -38,8 +38,15 @@ def to_date_iso(x):
 def main():
     r = requests.get(CSV_URL, timeout=60)
     r.raise_for_status()
+    
+    # принудительно декодируем как UTF-8 (Google Sheets CSV обычно UTF-8)
+    content = r.content
+    # убираем BOM если есть
+    if content.startswith(b"\xef\xbb\xbf"):
+        content = content[3:]
+    
+    text = content.decode("utf-8", errors="replace")
 
-    text = r.text.lstrip("\ufeff")
 
     # пробуем стандартную запятую, если не распарсилось — пробуем ; (часто в RU локали)
     def parse_with(delim):
