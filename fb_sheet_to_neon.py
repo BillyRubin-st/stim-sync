@@ -8,24 +8,29 @@ import psycopg2
 CSV_URL = os.environ["SHEETS_CSV_URL"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 
+def norm(s: str) -> str:
+    # убираем BOM, пробелы, переносы
+    return (s or "").replace("\ufeff", "").strip()
+
 def to_int(x):
     if x in (None, ""): return None
     try:
-        return int(float(str(x).replace(",", ".")))
+        return int(float(str(x).replace(" ", "").replace(",", ".")))
     except:
         return None
 
 def to_num(x):
     if x in (None, ""): return None
     try:
-        return float(str(x).replace(",", "."))
+        return float(str(x).replace(" ", "").replace(",", "."))
     except:
         return None
 
 def to_date_iso(x):
-    if not x: return None
+    s = norm(str(x)) if x is not None else ""
+    if not s: return None
     try:
-        dt = dateparser.parse(str(x), dayfirst=True)
+        dt = dateparser.parse(s, dayfirst=True)
         return dt.date().isoformat()
     except:
         return None
@@ -35,18 +40,41 @@ def main():
     r.raise_for_status()
 
     text = r.text.lstrip("\ufeff")
-    reader = csv.DictReader(io.StringIO(text))
 
-    required = ["Дата", "Название аккаунта", "Кампания"]
-    for col in required:
-        if col not in reader.fieldnames:
-            raise RuntimeError(f"Нет колонки {col}")
+    # пробуем стандартную запятую, если не распарсилось — пробуем ; (часто в RU локали)
+    def parse_with(delim):
+        return csv.DictReader(io.StringIO(text), delimiter=delim)
+
+    reader = parse_with(",")
+    if not reader.fieldnames or len(reader.fieldnames) <= 1:
+        reader = parse_with(";")
+
+    # нормализуем заголовки
+    raw_headers = reader.fieldnames or []
+    headers = [norm(h) for h in raw_headers]
+    print("HEADERS:", headers)
+
+    # создаём мапу "нормализованный заголовок" -> "как в CSV реально"
+    header_map = {norm(h): h for h in raw_headers}
+
+    def get(row, key):
+        # key — ожидаемое имя (например "Дата"), находим реальное
+        real = header_map.get(key)
+        if real is None:
+            return None
+        return row.get(real)
+
+    # проверяем обязательные колонки (по нормализованным именам)
+    required = ["Название аккаунта", "Кампания", "Дата"]
+    missing = [c for c in required if c not in header_map]
+    if missing:
+        raise RuntimeError(f"Нет колонки(ок): {missing}. Реальные заголовки: {headers}")
 
     rows = []
     for row in reader:
-        date = to_date_iso(row["Дата"])
-        acc = row["Название аккаунта"].strip()
-        camp = row["Кампания"].strip()
+        date = to_date_iso(get(row, "Дата"))
+        acc = norm(get(row, "Название аккаунта"))
+        camp = norm(get(row, "Кампания"))
         if not date or not acc or not camp:
             continue
 
@@ -54,15 +82,15 @@ def main():
             "date": date,
             "account_name": acc,
             "campaign": camp,
-            "leads": to_int(row.get("Лиды")),
-            "spend": to_num(row.get("Затраты")),
-            "cpl": to_num(row.get("Цена за лид")),
-            "reach": to_int(row.get("Охваты")),
-            "impressions": to_int(row.get("Показы")),
-            "link_clicks": to_int(row.get("Клики по ссылке")),
-            "cpm": to_num(row.get("CPM")),
-            "ctr": to_num(row.get("CTR (%)")),
-            "cr": to_num(row.get("CR (%)")),
+            "leads": to_int(get(row, "Лиды")),
+            "spend": to_num(get(row, "Затраты")),
+            "cpl": to_num(get(row, "Цена за лид")),
+            "reach": to_int(get(row, "Охваты")),
+            "impressions": to_int(get(row, "Показы")),
+            "link_clicks": to_int(get(row, "Клики по ссылке")),
+            "cpm": to_num(get(row, "CPM")),
+            "ctr": to_num(get(row, "CTR (%)")),
+            "cr": to_num(get(row, "CR (%)")),
         })
 
     if not rows:
