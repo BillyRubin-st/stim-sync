@@ -20,11 +20,29 @@ def to_int(x):
         return None
 
 def to_num(x):
-    if x in (None, ""): return None
+    def to_num(x):
+    if x is None:
+        return None
+    s = str(x).strip().replace(" ", "")
+    if s == "":
+        return None
+
+    # убираем знак процента
+    is_percent = False
+    if s.endswith("%"):
+        is_percent = True
+        s = s[:-1]
+
+    # заменяем запятую на точку
+    s = s.replace(",", ".")
+
     try:
-        return float(str(x).replace(" ", "").replace(",", "."))
+        val = float(s)
+        # оставляем как "3.15", не переводим в 0.0315 (для DataLens удобнее в процентах)
+        return val
     except:
         return None
+
 
 def to_date_iso(x):
     s = norm(str(x)) if x is not None else ""
