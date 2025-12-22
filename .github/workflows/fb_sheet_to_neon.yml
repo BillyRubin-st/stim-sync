@@ -2,7 +2,7 @@ name: FB Sheet → Neon
 
 on:
   schedule:
-    - cron: "20 3 * * *"   # 09:20 Бишкек
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 jobs:
