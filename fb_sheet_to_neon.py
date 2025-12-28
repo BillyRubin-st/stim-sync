@@ -1,5 +1,9 @@
 # fb_sheet_to_neon.py
 # Google Sheets (published CSV) -> Neon (Postgres) UPSERT
+# Updated for "Актуальные данные 2.0" (ads-level) with creatives:
+# - adset, ad_name, ad_id, creative_id, creative_name
+# - PRIMARY KEY: (date, account_name, campaign, adset, ad_id)
+#
 # Robust to:
 # - UTF-8 BOM / encoding issues
 # - delimiter , or ;
@@ -44,7 +48,6 @@ def to_num(x):
     if s == "":
         return None
 
-    # remove percent sign
     if s.endswith("%"):
         s = s[:-1]
 
@@ -80,10 +83,8 @@ def fetch_csv_text(url: str) -> str:
 
 def make_reader(csv_text: str) -> csv.DictReader:
     """Try comma delimiter first; if looks wrong, try semicolon."""
-    # comma
     reader = csv.DictReader(io.StringIO(csv_text), delimiter=",")
     if not reader.fieldnames or len(reader.fieldnames) <= 1:
-        # semicolon (common in RU locales)
         reader = csv.DictReader(io.StringIO(csv_text), delimiter=";")
     return reader
 
@@ -104,12 +105,34 @@ def get_cell(row: dict, header_map: dict, *keys: str):
 
 
 def ensure_table(cur):
+    # NOTE:
+    # This creates the table with the new schema if it doesn't exist.
+    # If you already have fb_ads_daily with an old PRIMARY KEY,
+    # run migration SQL in Neon (once):
+    #
+    # ALTER TABLE fb_ads_daily
+    # ADD COLUMN IF NOT EXISTS adset TEXT,
+    # ADD COLUMN IF NOT EXISTS ad_name TEXT,
+    # ADD COLUMN IF NOT EXISTS ad_id TEXT,
+    # ADD COLUMN IF NOT EXISTS creative_id TEXT,
+    # ADD COLUMN IF NOT EXISTS creative_name TEXT;
+    #
+    # ALTER TABLE fb_ads_daily DROP CONSTRAINT IF EXISTS fb_ads_daily_pkey;
+    # ALTER TABLE fb_ads_daily
+    # ADD CONSTRAINT fb_ads_daily_pkey PRIMARY KEY (date, account_name, campaign, adset, ad_id);
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS fb_ads_daily (
           date date NOT NULL,
           account_name text NOT NULL,
           campaign text NOT NULL,
+
+          adset text,
+          ad_name text,
+          ad_id text,
+          creative_id text,
+          creative_name text,
+
           leads integer,
           spend numeric,
           cpl numeric,
@@ -120,7 +143,8 @@ def ensure_table(cur):
           ctr numeric,
           cr numeric,
           updated_at timestamptz,
-          PRIMARY KEY (date, account_name, campaign)
+
+          PRIMARY KEY (date, account_name, campaign, adset, ad_id)
         );
         """
     )
@@ -129,12 +153,16 @@ def ensure_table(cur):
 def upsert_rows(cur, rows):
     sql = """
     INSERT INTO fb_ads_daily
-      (date, account_name, campaign, leads, spend, cpl, reach, impressions, link_clicks, cpm, ctr, cr, updated_at)
+      (date, account_name, campaign, adset, ad_name, ad_id, creative_id, creative_name,
+       leads, spend, cpl, reach, impressions, link_clicks, cpm, ctr, cr, updated_at)
     VALUES
-      (%(date)s, %(account_name)s, %(campaign)s, %(leads)s, %(spend)s, %(cpl)s, %(reach)s,
-       %(impressions)s, %(link_clicks)s, %(cpm)s, %(ctr)s, %(cr)s, NOW())
-    ON CONFLICT (date, account_name, campaign)
+      (%(date)s, %(account_name)s, %(campaign)s, %(adset)s, %(ad_name)s, %(ad_id)s, %(creative_id)s, %(creative_name)s,
+       %(leads)s, %(spend)s, %(cpl)s, %(reach)s, %(impressions)s, %(link_clicks)s, %(cpm)s, %(ctr)s, %(cr)s, NOW())
+    ON CONFLICT (date, account_name, campaign, adset, ad_id)
     DO UPDATE SET
+      ad_name = EXCLUDED.ad_name,
+      creative_id = EXCLUDED.creative_id,
+      creative_name = EXCLUDED.creative_name,
       leads = EXCLUDED.leads,
       spend = EXCLUDED.spend,
       cpl = EXCLUDED.cpl,
@@ -160,13 +188,12 @@ def main():
 
     print("HEADERS:", headers_norm)
 
-    # Required columns (with tolerant mapping):
-    # - account: "Название аккаунта" (may have extra spaces/BOM)
-    # - campaign: "Кампания"
-    # - date: "Дата" OR "Дата начала" (fallback)
+    # Required columns (tolerant mapping) for "Актуальные данные 2.0":
     required_any = {
         "account": ("Название аккаунта",),
         "campaign": ("Кампания",),
+        "adset": ("Адсет", "Adset"),
+        "ad_id": ("Ad ID", "ad_id"),
         "date": ("Дата", "Дата начала"),
     }
 
@@ -185,11 +212,24 @@ def main():
         acc_val = get_cell(row, header_map, "Название аккаунта")
         camp_val = get_cell(row, header_map, "Кампания")
 
+        adset_val = get_cell(row, header_map, "Адсет", "Adset")
+        ad_name_val = get_cell(row, header_map, "Объявление", "Ad Name", "ad_name")
+        ad_id_val = get_cell(row, header_map, "Ad ID", "ad_id")
+        creative_id_val = get_cell(row, header_map, "Creative ID", "creative_id")
+        creative_name_val = get_cell(row, header_map, "Creative Name", "creative_name")
+
         date = to_date_iso(date_val)
         account = norm(str(acc_val)) if acc_val is not None else ""
         campaign = norm(str(camp_val)) if camp_val is not None else ""
 
-        if not date or not account or not campaign:
+        adset = norm(str(adset_val)) if adset_val is not None else ""
+        ad_name = norm(str(ad_name_val)) if ad_name_val is not None else ""
+        ad_id = norm(str(ad_id_val)) if ad_id_val is not None else ""
+        creative_id = norm(str(creative_id_val)) if creative_id_val is not None else ""
+        creative_name = norm(str(creative_name_val)) if creative_name_val is not None else ""
+
+        # Required minimum for a unique row:
+        if not date or not account or not campaign or not ad_id:
             continue
 
         leads = to_int(get_cell(row, header_map, "Лиды"))
@@ -198,14 +238,11 @@ def main():
         reach = to_int(get_cell(row, header_map, "Охваты"))
         impressions = to_int(get_cell(row, header_map, "Показы"))
 
-        # Clicks column names might vary
         link_clicks = to_int(
             get_cell(row, header_map, "Клики по ссылке", "Клики по ссыл.", "Клики", "Link clicks", "link_clicks")
         )
 
         cpm = to_num(get_cell(row, header_map, "CPM", "Cpm", "cpm"))
-
-        # CTR/CR headers may vary; value might contain %
         ctr = to_num(get_cell(row, header_map, "CTR (%)", "CTR(%)", "CTR %", "CTR", "ctr"))
         cr = to_num(get_cell(row, header_map, "CR (%)", "CR(%)", "CR %", "CR", "cr"))
 
@@ -214,6 +251,13 @@ def main():
                 "date": date,
                 "account_name": account,
                 "campaign": campaign,
+
+                "adset": adset,
+                "ad_name": ad_name,
+                "ad_id": ad_id,
+                "creative_id": creative_id,
+                "creative_name": creative_name,
+
                 "leads": leads,
                 "spend": spend,
                 "cpl": cpl,
